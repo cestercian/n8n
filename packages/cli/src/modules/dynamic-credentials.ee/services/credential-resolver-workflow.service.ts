@@ -7,6 +7,7 @@ import { ICredentialContext, INode, isNodeWithWorkflowSelector, jsonParse } from
 import { DynamicCredentialsProxy } from '@/credentials/dynamic-credentials-proxy';
 import { BadRequestError } from '@/errors/response-errors/bad-request.error';
 import { NotFoundError } from '@/errors/response-errors/not-found.error';
+import { SubworkflowPolicyChecker } from '@/executions/pre-execution-checks';
 import { WorkflowFinderService } from '@/workflows/workflow-finder.service';
 
 import { DynamicCredentialResolverRegistry } from './credential-resolver-registry.service';
@@ -54,6 +55,7 @@ export class CredentialResolverWorkflowService {
 		private readonly cipher: Cipher,
 		private readonly dynamicCredentialsProxy: DynamicCredentialsProxy,
 		private readonly workflowFinderService: WorkflowFinderService,
+		private readonly subworkflowPolicyChecker: SubworkflowPolicyChecker,
 	) {}
 
 	private async getResolver(resolverId: string): Promise<ResolvedResolver> {
@@ -84,7 +86,8 @@ export class CredentialResolverWorkflowService {
 	 * gate form shells or submit. Traverses Execute Sub-workflow and AI Workflow Tool references
 	 * recursively, deduplicating both workflows (cycles / self-references / diamond references)
 	 * and credentials, then tests credential availability by attempting to retrieve secrets
-	 * using the provided identity token.
+	 * using the provided identity token. Sub-workflows are included only when the parent is
+	 * allowed to call them, using the same caller-policy check as execution.
 	 *
 	 * @param workflowId - The (root) workflow ID to check
 	 * @param credentialContext - Identity context used for credential authorization
@@ -161,6 +164,7 @@ export class CredentialResolverWorkflowService {
 		visited: Set<string>,
 		user: User | undefined,
 		isRoot: boolean,
+		parentWorkflowId?: string,
 	): Promise<void> {
 		if (visited.has(workflowId)) {
 			return;
@@ -174,8 +178,8 @@ export class CredentialResolverWorkflowService {
 		}
 		visited.add(workflowId);
 
-		// Enforce the session user's access on the root workflow only. Sub-workflows resolve by id
-		// to match execution-time semantics (a sub-workflow runs regardless of who can read it).
+		// Session users must have access to the root workflow. Sub-workflows load by id;
+		// the same caller-policy check as execution decides whether to include them.
 		const workflow =
 			isRoot && user
 				? await this.workflowFinderService.findWorkflowForUser(workflowId, user, ['workflow:read'])
@@ -187,6 +191,16 @@ export class CredentialResolverWorkflowService {
 			}
 			// A referenced sub-workflow may have been deleted; skip it rather than failing the check.
 			return;
+		}
+
+		if (!isRoot && parentWorkflowId) {
+			const allowed = await this.subworkflowPolicyChecker.isAllowedToCall(
+				{ id: workflow.id, settings: workflow.settings },
+				parentWorkflowId,
+			);
+			if (!allowed) {
+				return;
+			}
 		}
 
 		const resolverId = this.dynamicCredentialsProxy.getEffectiveResolverId(workflow.settings);
@@ -207,7 +221,7 @@ export class CredentialResolverWorkflowService {
 		}
 
 		for (const subWorkflowId of this.extractSubWorkflowIds(workflow.nodes ?? [])) {
-			await this.collectResolvableCredentials(subWorkflowId, acc, visited, user, false);
+			await this.collectResolvableCredentials(subWorkflowId, acc, visited, user, false, workflowId);
 		}
 	}
 

@@ -1,6 +1,6 @@
 import type { MockInstance } from 'vitest';
 import { LicenseState } from '@n8n/backend-common';
-import { mockInstance, getPersonalProject, testDb } from '@n8n/backend-test-utils';
+import { createWorkflow, mockInstance, getPersonalProject, testDb } from '@n8n/backend-test-utils';
 import type { CredentialsEntity, User } from '@n8n/db';
 import {
 	GLOBAL_OWNER_ROLE,
@@ -105,7 +105,7 @@ const setupWorkflow = async () => {
 		role: 'workflow:owner',
 	});
 
-	return { savedWorkflow, savedCredential, owner };
+	return { savedWorkflow, savedCredential, owner, resolver };
 };
 
 describe('Workflow Status API', () => {
@@ -114,6 +114,7 @@ describe('Workflow Status API', () => {
 	let owner: User;
 	let unrelatedMember: User;
 	let isLeaderSpy: MockInstance;
+	let resolverId: string;
 
 	beforeAll(async () => {
 		// Force leader role so N8nResolverSeeder.seed() runs (not no-op for followers).
@@ -157,7 +158,11 @@ describe('Workflow Status API', () => {
 		// references for any workflow without an explicit `credentialResolverId`.
 		await Container.get(N8nResolverSeeder).seed();
 
-		({ savedWorkflow, savedCredential, owner } = await setupWorkflow());
+		const setup = await setupWorkflow();
+		savedWorkflow = setup.savedWorkflow;
+		savedCredential = setup.savedCredential;
+		owner = setup.owner;
+		resolverId = setup.resolver.id;
 
 		// A second regular member with no relationship to the owner's workflow:
 		// not the owner, no project membership, no sharing.
@@ -280,6 +285,169 @@ describe('Workflow Status API', () => {
 					expect([403, 404]).toContain(response.status);
 					expect(response.body?.data).toBeUndefined();
 				});
+			});
+		});
+
+		describe('when the workflow references another workflow', () => {
+			const createExecuteWorkflowNode = (subWorkflowId: string): INode => ({
+				id: uuid(),
+				name: 'Execute Workflow',
+				type: 'n8n-nodes-base.executeWorkflow',
+				typeVersion: 1,
+				position: [0, 0],
+				parameters: {
+					source: 'database',
+					workflowId: { value: subWorkflowId },
+				},
+			});
+
+			const createCredentialNode = (credential: CredentialsEntity): INode => ({
+				id: uuid(),
+				name: 'HTTP Request',
+				type: 'n8n-nodes-base.httpRequest',
+				typeVersion: 1,
+				position: [0, 0],
+				parameters: {},
+				credentials: {
+					oAuth2Api: {
+						id: credential.id,
+						name: credential.name,
+					},
+				},
+			});
+
+			it('should omit credentials from a referenced workflow the parent is not allowed to call', async () => {
+				const memberParent = await createWorkflow(
+					{
+						name: 'Member parent',
+						nodes: [createExecuteWorkflowNode(savedWorkflow.id)],
+						connections: {},
+					},
+					unrelatedMember,
+				);
+
+				const response = await testServer
+					.authAgentFor(unrelatedMember)
+					.get(`/workflows/${memberParent.id}/execution-status`)
+					.set('Authorization', 'Bearer test-token')
+					.expect(200);
+
+				const credentialIds = (
+					response.body.data.credentials as Array<{ credentialId: string }>
+				).map((c) => c.credentialId);
+				expect(credentialIds).not.toContain(savedCredential.id);
+			});
+
+			it('should omit referenced-workflow credentials for static-token callers when the parent cannot call it', async () => {
+				const memberParent = await createWorkflow(
+					{
+						name: 'Member parent static',
+						nodes: [createExecuteWorkflowNode(savedWorkflow.id)],
+						connections: {},
+					},
+					unrelatedMember,
+				);
+
+				const response = await testServer.authlessAgent
+					.get(`/workflows/${memberParent.id}/execution-status`)
+					.set('Authorization', 'Bearer test-token')
+					.set('X-Authorization', 'Bearer static-test-token')
+					.expect(200);
+
+				const credentialIds = (
+					response.body.data.credentials as Array<{ credentialId: string }>
+				).map((c) => c.credentialId);
+				expect(credentialIds).not.toContain(savedCredential.id);
+			});
+
+			it('should include credentials from a referenced workflow the parent is allowed to call', async () => {
+				const ownerProject = await getPersonalProject(owner);
+				const sameOwnerCredential = await createCredentials(
+					{
+						name: 'Same-owner sub credential',
+						type: 'OAuth2',
+						data: '',
+						isResolvable: true,
+						resolverId,
+					},
+					ownerProject,
+				);
+				const sameOwnerSub = await createWorkflow(
+					{
+						name: 'Owner sub',
+						nodes: [createCredentialNode(sameOwnerCredential)],
+						connections: {},
+						settings: { credentialResolverId: resolverId },
+					},
+					owner,
+				);
+				const sameOwnerParent = await createWorkflow(
+					{
+						name: 'Owner parent',
+						nodes: [createExecuteWorkflowNode(sameOwnerSub.id)],
+						connections: {},
+					},
+					owner,
+				);
+
+				const response = await testServer
+					.authAgentFor(owner)
+					.get(`/workflows/${sameOwnerParent.id}/execution-status`)
+					.set('Authorization', 'Bearer test-token')
+					.expect(200);
+
+				const credentialIds = (
+					response.body.data.credentials as Array<{ credentialId: string }>
+				).map((c) => c.credentialId);
+				expect(credentialIds).toContain(sameOwnerCredential.id);
+			});
+
+			it('should include credentials from a referenced workflow that lists the parent as a caller', async () => {
+				const ownerProject = await getPersonalProject(owner);
+				const listedCredential = await createCredentials(
+					{
+						name: 'Listed-caller credential',
+						type: 'OAuth2',
+						data: '',
+						isResolvable: true,
+						resolverId,
+					},
+					ownerProject,
+				);
+				const memberParent = await createWorkflow(
+					{
+						name: 'Member listed parent',
+						nodes: [],
+						connections: {},
+					},
+					unrelatedMember,
+				);
+				const listedSub = await createWorkflow(
+					{
+						name: 'Listed sub',
+						nodes: [createCredentialNode(listedCredential)],
+						connections: {},
+						settings: {
+							callerPolicy: 'workflowsFromAList',
+							callerIds: memberParent.id,
+							credentialResolverId: resolverId,
+						},
+					},
+					owner,
+				);
+				memberParent.nodes = [createExecuteWorkflowNode(listedSub.id)];
+				await Container.get(WorkflowRepository).save(memberParent);
+
+				const response = await testServer
+					.authAgentFor(unrelatedMember)
+					.get(`/workflows/${memberParent.id}/execution-status`)
+					.set('Authorization', 'Bearer test-token')
+					.expect(200);
+
+				const credentialIds = (
+					response.body.data.credentials as Array<{ credentialId: string }>
+				).map((c) => c.credentialId);
+				expect(credentialIds).toContain(listedCredential.id);
 			});
 		});
 	});

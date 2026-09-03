@@ -6,6 +6,7 @@ import type { Cipher } from 'n8n-core';
 import type { INode, NodeParameterValueType } from 'n8n-workflow';
 
 import type { DynamicCredentialsProxy } from '@/credentials/dynamic-credentials-proxy';
+import type { SubworkflowPolicyChecker } from '@/executions/pre-execution-checks';
 import type { WorkflowFinderService } from '@/workflows/workflow-finder.service';
 
 import { DynamicCredentialResolver } from '../../database/entities/credential-resolver';
@@ -84,6 +85,7 @@ describe('CredentialResolverWorkflowService', () => {
 	let mockResolverImplementation: Mocked<ICredentialResolver>;
 	let mockDynamicCredentialsProxy: Mocked<DynamicCredentialsProxy>;
 	let mockWorkflowFinderService: Mocked<WorkflowFinderService>;
+	let mockSubworkflowPolicyChecker: Mocked<SubworkflowPolicyChecker>;
 
 	beforeEach(() => {
 		vi.clearAllMocks();
@@ -129,6 +131,11 @@ describe('CredentialResolverWorkflowService', () => {
 			findWorkflowForUser: vi.fn(),
 		} as unknown as Mocked<WorkflowFinderService>;
 
+		mockSubworkflowPolicyChecker = {
+			isAllowedToCall: vi.fn().mockResolvedValue(true),
+			check: vi.fn(),
+		} as unknown as Mocked<SubworkflowPolicyChecker>;
+
 		service = new CredentialResolverWorkflowService(
 			mockWorkflowRepository,
 			mockCredentialRepository,
@@ -137,6 +144,7 @@ describe('CredentialResolverWorkflowService', () => {
 			mockCipher,
 			mockDynamicCredentialsProxy,
 			mockWorkflowFinderService,
+			mockSubworkflowPolicyChecker,
 		);
 	});
 
@@ -923,21 +931,21 @@ describe('CredentialResolverWorkflowService', () => {
 				);
 			});
 
-			it('enforces user access on the root but resolves sub-workflows by id', async () => {
+			it('enforces user access on the root and caller policy on sub-workflows', async () => {
 				const user = { id: 'user-1' } as unknown as Parameters<typeof service.getWorkflowStatus>[2];
-				mockWorkflowFinderService.findWorkflowForUser.mockResolvedValue(
-					createMockWorkflow({
-						id: 'workflow-1',
-						nodes: [nodeWithCredential('cred-root'), createExecuteWorkflowNode({ value: 'sub-1' })],
-						settings: { credentialResolverId: 'resolver-1' },
-					}),
-				);
+				const rootWorkflow = createMockWorkflow({
+					id: 'workflow-1',
+					nodes: [nodeWithCredential('cred-root'), createExecuteWorkflowNode({ value: 'sub-1' })],
+					settings: { credentialResolverId: 'resolver-1' },
+				});
+				const subWorkflow = createMockWorkflow({
+					id: 'sub-1',
+					nodes: [nodeWithCredential('cred-sub')],
+					settings: { credentialResolverId: 'resolver-1' },
+				});
+				mockWorkflowFinderService.findWorkflowForUser.mockResolvedValue(rootWorkflow);
 				mockWorkflowsById({
-					'sub-1': createMockWorkflow({
-						id: 'sub-1',
-						nodes: [nodeWithCredential('cred-sub')],
-						settings: { credentialResolverId: 'resolver-1' },
-					}),
+					'sub-1': subWorkflow,
 				});
 				mockFindReturning([
 					createMockCredential({ id: 'cred-root' }),
@@ -952,9 +960,107 @@ describe('CredentialResolverWorkflowService', () => {
 					user,
 					['workflow:read'],
 				);
-				// Sub-workflow loaded by id, not through the user-scoped finder.
 				expect(mockWorkflowRepository.get).toHaveBeenCalledWith({ id: 'sub-1' });
 				expect(mockWorkflowFinderService.findWorkflowForUser).toHaveBeenCalledTimes(1);
+				expect(mockSubworkflowPolicyChecker.isAllowedToCall).toHaveBeenCalledWith(
+					{ id: 'sub-1', settings: subWorkflow.settings },
+					'workflow-1',
+				);
+			});
+
+			it('omits credentials from a referenced workflow the parent is not allowed to call', async () => {
+				mockSubworkflowPolicyChecker.isAllowedToCall.mockResolvedValue(false);
+				mockWorkflowsById({
+					'workflow-1': createMockWorkflow({
+						id: 'workflow-1',
+						nodes: [nodeWithCredential('cred-root'), createExecuteWorkflowNode({ value: 'sub-1' })],
+						settings: { credentialResolverId: 'resolver-1' },
+					}),
+					'sub-1': createMockWorkflow({
+						id: 'sub-1',
+						nodes: [nodeWithCredential('cred-sub')],
+						settings: { credentialResolverId: 'resolver-1' },
+					}),
+				});
+				mockFindReturning([
+					createMockCredential({ id: 'cred-root' }),
+					createMockCredential({ id: 'cred-sub' }),
+				]);
+
+				const result = await service.getWorkflowStatus('workflow-1', credentialContext);
+
+				expect(result.map((s) => s.credentialId)).toEqual(['cred-root']);
+				expect(mockSubworkflowPolicyChecker.isAllowedToCall).toHaveBeenCalledWith(
+					expect.objectContaining({ id: 'sub-1' }),
+					'workflow-1',
+				);
+			});
+
+			it('does not walk children of a referenced workflow the parent is not allowed to call', async () => {
+				mockSubworkflowPolicyChecker.isAllowedToCall.mockImplementation(async (target) => {
+					return target.id !== 'sub-1';
+				});
+				mockWorkflowsById({
+					'workflow-1': createMockWorkflow({
+						id: 'workflow-1',
+						nodes: [createExecuteWorkflowNode({ value: 'sub-1' })],
+						settings: { credentialResolverId: 'resolver-1' },
+					}),
+					'sub-1': createMockWorkflow({
+						id: 'sub-1',
+						nodes: [
+							nodeWithCredential('cred-sub'),
+							createExecuteWorkflowNode({ value: 'nested' }, { id: 'to-nested' }),
+						],
+						settings: { credentialResolverId: 'resolver-1' },
+					}),
+					nested: createMockWorkflow({
+						id: 'nested',
+						nodes: [nodeWithCredential('cred-nested')],
+						settings: { credentialResolverId: 'resolver-1' },
+					}),
+				});
+				mockFindReturning([
+					createMockCredential({ id: 'cred-sub' }),
+					createMockCredential({ id: 'cred-nested' }),
+				]);
+
+				const result = await service.getWorkflowStatus('workflow-1', credentialContext);
+
+				expect(result).toEqual([]);
+				expect(mockWorkflowRepository.get).not.toHaveBeenCalledWith({ id: 'nested' });
+			});
+
+			it('evaluates caller policy against the immediate parent for nested references', async () => {
+				mockWorkflowsById({
+					'workflow-1': createMockWorkflow({
+						id: 'workflow-1',
+						nodes: [createExecuteWorkflowNode({ value: 'sub-1' })],
+						settings: {},
+					}),
+					'sub-1': createMockWorkflow({
+						id: 'sub-1',
+						nodes: [createExecuteWorkflowNode({ value: 'nested' })],
+						settings: {},
+					}),
+					nested: createMockWorkflow({
+						id: 'nested',
+						nodes: [nodeWithCredential('cred-nested')],
+						settings: { credentialResolverId: 'resolver-1' },
+					}),
+				});
+				mockFindReturning([createMockCredential({ id: 'cred-nested' })]);
+
+				await service.getWorkflowStatus('workflow-1', credentialContext);
+
+				expect(mockSubworkflowPolicyChecker.isAllowedToCall).toHaveBeenCalledWith(
+					expect.objectContaining({ id: 'sub-1' }),
+					'workflow-1',
+				);
+				expect(mockSubworkflowPolicyChecker.isAllowedToCall).toHaveBeenCalledWith(
+					expect.objectContaining({ id: 'nested' }),
+					'sub-1',
+				);
 			});
 		});
 	});

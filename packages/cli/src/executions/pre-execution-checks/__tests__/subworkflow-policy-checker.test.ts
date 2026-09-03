@@ -102,6 +102,50 @@ describe('SubworkflowPolicyChecker', () => {
 		});
 	});
 
+	describe('isAllowedToCall', () => {
+		it('should return true when caller policy is `any`', async () => {
+			const parentWorkflow = mock<WorkflowEntity>({ id: uuid() });
+			const subworkflow = mock<Workflow>({ id: uuid(), settings: { callerPolicy: 'any' } });
+
+			await expect(checker.isAllowedToCall(subworkflow, parentWorkflow.id)).resolves.toBe(true);
+			expect(ownershipService.getWorkflowProjectCached).not.toHaveBeenCalled();
+		});
+
+		it('should return false when caller policy is `none`', async () => {
+			const parentWorkflow = mock<WorkflowEntity>({ id: uuid() });
+			const subworkflow = mock<Workflow>({ id: uuid(), settings: { callerPolicy: 'none' } });
+
+			await expect(checker.isAllowedToCall(subworkflow, parentWorkflow.id)).resolves.toBe(false);
+		});
+
+		it('should return false when the two workflows are owned by different projects', async () => {
+			const parentWorkflowProject = mock<Project>({ id: uuid() });
+			const subworkflowProject = mock<Project>({ id: uuid() });
+			ownershipService.getWorkflowProjectCached.mockResolvedValueOnce(parentWorkflowProject);
+			ownershipService.getWorkflowProjectCached.mockResolvedValueOnce(subworkflowProject);
+
+			const subworkflow = mock<Workflow>({
+				id: uuid(),
+				settings: { callerPolicy: 'workflowsFromSameOwner' },
+			});
+
+			await expect(checker.isAllowedToCall(subworkflow, uuid())).resolves.toBe(false);
+		});
+
+		it('should return true when both workflows are owned by the same project', async () => {
+			const bothWorkflowsProject = mock<Project>({ id: uuid() });
+			ownershipService.getWorkflowProjectCached.mockResolvedValueOnce(bothWorkflowsProject);
+			ownershipService.getWorkflowProjectCached.mockResolvedValueOnce(bothWorkflowsProject);
+
+			const subworkflow = mock<Workflow>({
+				id: uuid(),
+				settings: { callerPolicy: 'workflowsFromSameOwner' },
+			});
+
+			await expect(checker.isAllowedToCall(subworkflow, uuid())).resolves.toBe(true);
+		});
+	});
+
 	describe('`any` caller policy', () => {
 		it('should not throw on a regular subworkflow call', async () => {
 			const parentWorkflow = mock<WorkflowEntity>({ id: uuid() });
