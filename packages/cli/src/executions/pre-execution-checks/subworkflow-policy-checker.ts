@@ -36,27 +36,8 @@ export class SubworkflowPolicyChecker {
 		subworkflow: SubworkflowPolicyTarget,
 		parentWorkflowId: string,
 	): Promise<boolean> {
-		const { id: subworkflowId } = subworkflow;
-
-		if (!subworkflowId) return true; // e.g. when running a subworkflow loaded from a file
-
-		const policy = this.findPolicy(subworkflow);
-
-		if (policy === 'any') return true;
-
-		if (policy === 'workflowsFromAList' && this.isListed(subworkflow, parentWorkflowId)) {
-			return true;
-		}
-
-		if (policy === 'workflowsFromSameOwner') {
-			const { parentWorkflowProject, subworkflowProject } = await this.findProjects({
-				parentWorkflowId,
-				subworkflowId,
-			});
-			return parentWorkflowProject.id === subworkflowProject.id;
-		}
-
-		return false;
+		const result = await this.evaluate(subworkflow, parentWorkflowId);
+		return result.allowed;
 	}
 
 	/**
@@ -68,21 +49,15 @@ export class SubworkflowPolicyChecker {
 		node?: INode,
 		userId?: string,
 	) {
-		const { id: subworkflowId } = subworkflow;
+		const result = await this.evaluate(subworkflow, parentWorkflowId);
+		if (result.allowed) return;
 
-		if (!subworkflowId) return; // e.g. when running a subworkflow loaded from a file
+		const { subworkflowId, policy } = result;
+		this.logDenial({ parentWorkflowId, subworkflowId, policy });
 
-		if (await this.isAllowedToCall(subworkflow, parentWorkflowId)) return;
-
-		const policy = this.findPolicy(subworkflow);
-		if (policy !== 'any') {
-			this.logDenial({ parentWorkflowId, subworkflowId, policy });
-		}
-
-		const { subworkflowProject } = await this.findProjects({
-			parentWorkflowId,
-			subworkflowId,
-		});
+		const subworkflowProject =
+			result.subworkflowProject ??
+			(await this.findProjects({ parentWorkflowId, subworkflowId })).subworkflowProject;
 
 		const errorDetails = await this.errorDetails(subworkflowProject, subworkflowId, userId);
 
@@ -93,6 +68,39 @@ export class SubworkflowPolicyChecker {
 			instanceUrl: this.urlService.getInstanceBaseUrl(),
 			...errorDetails,
 		});
+	}
+
+	private async evaluate(
+		subworkflow: SubworkflowPolicyTarget,
+		parentWorkflowId: string,
+	): Promise<
+		| { allowed: true }
+		| { allowed: false; subworkflowId: string; policy: DenialPolicy; subworkflowProject?: Project }
+	> {
+		const { id: subworkflowId } = subworkflow;
+
+		if (!subworkflowId) return { allowed: true }; // e.g. when running a subworkflow loaded from a file
+
+		const policy = this.findPolicy(subworkflow);
+
+		if (policy === 'any') return { allowed: true };
+
+		if (policy === 'workflowsFromAList' && this.isListed(subworkflow, parentWorkflowId)) {
+			return { allowed: true };
+		}
+
+		if (policy === 'workflowsFromSameOwner') {
+			const { parentWorkflowProject, subworkflowProject } = await this.findProjects({
+				parentWorkflowId,
+				subworkflowId,
+			});
+			if (parentWorkflowProject.id === subworkflowProject.id) {
+				return { allowed: true };
+			}
+			return { allowed: false, subworkflowId, policy, subworkflowProject };
+		}
+
+		return { allowed: false, subworkflowId, policy };
 	}
 
 	private async errorDetails(subworkflowProject: Project, subworkflowId: string, userId?: string) {
